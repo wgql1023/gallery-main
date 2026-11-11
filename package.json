@@ -1,0 +1,22 @@
+{
+  "name": "gallery",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "图片分享系统 —— 分块断点续传上传 + 瀑布流前台 + 管理后台",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test",
+    "seed": "node --disable-warning=ExperimentalWarning src/seed.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "markdown-it": "^14.3.3",
+    "multer": "^2.5.0",
+    "sharp": "^0.34.2"
+  }
+}

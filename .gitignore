@@ -1,0 +1,16 @@
+# 依赖
+node_modules/
+
+# 运行数据（SQLite 数据库 / 上传文件 / 日志）
+data/
+*.log
+server.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 打包的zip版本包
+gallery-v*.zip
+# 工具内部目录
+.codeartsdoer/
