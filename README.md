@@ -68,10 +68,10 @@
 
 ```bash
 # 环境要求：Node.js ≥ 22.5（内置 node:sqlite）+ sharp（安装时自动下载预编译二进制）
-git clone https://github.com/hakd-code/gallery.git
-cd gallery
+git clone https://github.com/wgql1023/gallery-main.git
+cd gallery-main
 npm install
-npm start          # 打开 http://localhost:3100
+npm start          # 默认监听 0.0.0.0:8000（可用 PORT=3100 覆盖）
 ```
 
 首次启动自动创建管理员账号（可用环境变量覆盖）：
@@ -85,10 +85,12 @@ npm start          # 打开 http://localhost:3100
 
 ```bash
 npm run seed       # 生成 8 张演示图 + 2 个已发布分享 + 1 个草稿（仅空库时生效）
-npm test           # 31 个单元 / 接口测试
+npm test           # 34 个单元 / 接口测试
 ```
 
 自定义：`PORT=8080 npm start`、`ADMIN_USER=xxx ADMIN_PASSWORD=xxx npm start`
+
+> **部署到 Uppcoder / websson.cloud**：平台入口约定为 `index.js` + 监听 `APP_PORT`，本项目已适配，直接连接 GitHub 仓库部署即可，无需额外配置。
 
 ## 🧱 技术栈
 
@@ -96,6 +98,7 @@ npm test           # 31 个单元 / 接口测试
 |---|---|
 | 运行时 | Node.js ≥ 22.5 原生 ESM（零构建步骤） |
 | Web 框架 | Express 4 |
+| 上传解析 | multer 2（multipart/form-data，`/api/upload`） |
 | 数据库 | `node:sqlite`（Node 22 内置，零原生编译依赖） |
 | 图片处理 | sharp（EXIF 自动摆正 → 缩略图 / 预览图 WebP → blurhash 占位） |
 | 鉴权 | JWT（HS256，`node:crypto` 自实现）+ scrypt 口令散列 + HttpOnly Cookie 会话 |
@@ -105,10 +108,12 @@ npm test           # 31 个单元 / 接口测试
 ## 📁 项目结构
 
 ```
-gallery/
-├── server.js               # 入口
+gallery-main/
+├── index.js                # 入口（平台约定 + node:sqlite flag 自愈）
+├── server.js               # Express 启动 / 优雅关停
+├── Procfile                # PaaS 进程声明
 ├── src/
-│   ├── app.js              # Express 装配（前台 / 后台 / 上传协议 / 媒体服务）
+│   ├── app.js              # Express 装配（前台 / 后台 / 上传协议 / 媒体服务 / 健康检查）
 │   ├── db.js               # SQLite 数据访问层（6 张表）
 │   ├── lib/
 │   │   ├── uploader.js     # ⭐ 分块断点续传会话管理（可跨项目复用）
@@ -122,7 +127,7 @@ gallery/
 │   ├── uploader.mjs        # ⭐ 上传客户端（并发 / 重试 / 暂停 / 续传）
 │   ├── sha256.mjs          # 纯 JS 增量 SHA-256
 │   └── hash-worker.mjs     # Web Worker 指纹计算
-├── tests/                  # 31 个单元 / 接口测试
+├── tests/                  # 34 个单元 / 接口测试
 ├── docs/screenshots/       # README 截图
 └── data/                   # 运行数据（首次运行自动创建，已在 .gitignore 排除）
     ├── gallery.db          # SQLite 数据库：分享 / 资产索引 / 上传会话 / 站点配置等
@@ -134,16 +139,185 @@ gallery/
 ## 🔌 API 摘要
 
 ```
+GET    /health                       健康检查（探活，无需鉴权）
 POST   /api/admin/login               登录 → JWT（同时写入 Cookie 会话）
+POST   /api/upload                    ⭐ multipart 直传图片 → JSON 外链（Bearer token 鉴权）
 POST   /api/upload/init               预检：秒传 / 续传 / 建会话
 PUT    /api/upload/chunk/:id/:index   传分块（4MB）
 POST   /api/upload/complete/:id       合并 + 校验 + 入库
-POST   /api/upload/direct             ≤8MB 直传快速通道
+POST   /api/upload/direct             ≤8MB octet-stream 直传快速通道
 POST   /api/shares                    发布 { contentText, assets[{assetId, caption}], status }
 GET    /api/shares?cursor=&limit=     前台分页列表
 PATCH  /api/shares/:id                编辑 / 上下架
 DELETE /api/shares/:id                删除（联动清理孤儿文件）
-GET    /media/{key}                   静态媒体（immutable 永久缓存）
+GET    /media/{key}                   静态媒体（immutable 永久缓存，公开访问）
+```
+
+## 📖 API 接口对接文档
+
+### 鉴权
+
+除 `/health`、`/api/shares`（前台只读列表/详情）、`/media/*` 外，所有接口需鉴权。支持三种等价方式（任选其一）：
+
+| 方式 | 示例 |
+|---|---|
+| Bearer 头（推荐） | `Authorization: Bearer <token>` |
+| 自定义头 | `X-Token: <token>` |
+| 查询参数 | `?token=<token>` |
+
+`token` 由 `POST /api/admin/login` 返回。
+
+### 1. 登录
+
+```
+POST /api/admin/login
+Content-Type: application/json
+
+{ "username": "admin", "password": "admin123" }
+```
+
+**响应**：
+```json
+{ "token": "eyJhbGciOiJIUzI1NiIsInR5...", "username": "admin" }
+```
+错误凭据返回 `401`。
+
+### 2. 上传图片（multipart 直传，返回外链）⭐
+
+最简单的对接方式：一次 HTTP 请求即可拿到图片外链，适合脚本 / 第三方应用集成。
+
+```
+POST /api/upload
+Authorization: Bearer <token>
+Content-Type: multipart/form-data; boundary=...
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="photo.jpg"
+Content-Type: image/jpeg
+
+<二进制数据>
+--boundary--
+```
+
+**字段**：`file`（必填，单文件，上限 8MB）
+
+**成功响应** `200`：
+```json
+{
+  "assetId": 12,
+  "deduped": false,
+  "url":     "https://your-host/media/assets/202611/<sha256>.png",
+  "thumb":   "https://your-host/media/assets/202611/<sha256>.thumb.webp",
+  "preview": "https://your-host/media/assets/202611/<sha256>.preview.webp",
+  "mime":    "image/png",
+  "size":    8592,
+  "width":   800,
+  "height":  600
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `url` | **原图外链直链**，可公开访问（无需 token），`Cache-Control: immutable` |
+| `thumb` | 缩略图外链（WebP，宽 480px） |
+| `preview` | 预览图外链（WebP，宽 1080px） |
+| `deduped` | `true` 表示内容已存在，秒传命中，未实际写盘 |
+| `assetId` | 资产 ID，用于后续发布分享时引用 |
+
+**curl 示例**：
+```bash
+# 上传并直接拿到外链
+curl -X POST https://your-host/api/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@photo.jpg"
+```
+
+**Node.js (undici/fetch) 示例**：
+```js
+const form = new FormData();
+form.append('file', new Blob([fileBuffer]), 'photo.jpg');
+const resp = await fetch('https://your-host/api/upload', {
+  method: 'POST',
+  headers: { Authorization: 'Bearer ' + token },
+  body: form,
+});
+const { url } = await resp.json();  // url 即为图片外链
+```
+
+**Python (requests) 示例**：
+```python
+import requests
+r = requests.post('https://your-host/api/upload',
+    headers={'Authorization': f'Bearer {token}'},
+    files={'file': open('photo.jpg', 'rb')})
+print(r.json()['url'])  # 图片外链
+```
+
+**错误码**：
+
+| 状态码 | 含义 |
+|---|---|
+| `401` | 未提供 token 或 token 无效 |
+| `400` | 未提供 `file` 字段 / multipart 解析失败 |
+| `413` | 文件超过 8MB 上限 |
+| `415` | magic number 不在白名单（伪装文件被拒） |
+| `500` | 服务端处理失败（sharp 异常 / 磁盘满等） |
+
+**支持的图片格式**：JPEG / PNG / WebP / GIF / AVIF（按文件头 magic number 判定，扩展名不参与判断）。
+
+### 3. 分块断点续传（大文件 / 高并发场景）
+
+适用于 >8MB 或需要断点续传的场景，详见上方「核心技术」协议说明。端点：
+
+```
+POST /api/upload/init               body: { filename, size, hash } → { exists, uploadId, totalChunks, uploadedChunks? }
+PUT  /api/upload/chunk/:id/:index   body: <二进制分块，4MB>
+POST /api/upload/complete/:id       body: { hash } → { assetId }
+GET  /api/upload/session/:id        查询会话状态（已消费则 404）
+```
+
+### 4. 发布分享
+
+```
+POST /api/shares
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "title": "可选标题",
+  "contentText": "文案正文",
+  "status": "published",            // 或 "draft"
+  "assets": [
+    { "assetId": 12, "caption": "图注1" },
+    { "assetId": 13, "caption": "图注2" }
+  ]
+}
+```
+
+**响应**：`{ id, slug, ... }`（`slug` 为 8 位短链，前台访问 `/s/:slug`）
+
+### 5. 完整对接示例（curl 一条龙）
+
+```bash
+HOST=https://your-host
+
+# 登录
+TOKEN=$(curl -s -X POST $HOST/api/admin/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r .token)
+
+# 上传图片 → 拿外链
+UP=$(curl -s -X POST $HOST/api/upload \
+  -H "Authorization: Bearer $TOKEN" -F "file=@photo.jpg")
+URL=$(echo $UP | jq -r .url)
+ASSET=$(echo $UP | jq -r .assetId)
+echo "图片外链: $URL"
+
+# 发布带图的分享
+curl -s -X POST $HOST/api/shares \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"contentText\":\"刚上传的图\",\"status\":\"published\",\"assets\":[{\"assetId\":$ASSET}]}"
 ```
 
 ## ✅ 测试
@@ -152,7 +326,7 @@ GET    /media/{key}                   静态媒体（immutable 永久缓存）
 npm test
 ```
 
-31 个测试覆盖：断点续传全流程（部分上传 → 重新 init 返回已传列表 → 补齐完成）、**分块损坏指纹校验拒绝**、秒传去重、magic number 伪装文件拒绝（415）、目录穿越防护、草稿前台不可见、删除联动清理、Cookie 会话守卫 302、密码修改后旧密码失效、blurhash 往返、纯 JS SHA-256 与 node:crypto 随机对照等。
+34 个测试覆盖：断点续传全流程（部分上传 → 重新 init 返回已传列表 → 补齐完成）、**分块损坏指纹校验拒绝**、秒传去重、magic number 伪装文件拒绝（415）、**multipart 直传 `/api/upload`（鉴权 / 秒传 / 直链可访问 / 伪装拒绝）**、目录穿越防护、草稿前台不可见、删除联动清理、Cookie 会话守卫 302、密码修改后旧密码失效、blurhash 往返、纯 JS SHA-256 与 node:crypto 随机对照等。
 
 ## 📄 License
 
