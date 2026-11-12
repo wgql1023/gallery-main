@@ -727,3 +727,24 @@ test('P4：magic 通过但 sharp 解码失败返回 400 而非 500', async () =>
   resp = await fetch(base + '/api/upload', { method: 'POST', headers: auth(), body: fd });
   assert.equal(resp.status, 400, 'multipart 解码失败同样应返回 400');
 });
+test('P5：TTL 别名字段（ttlHours/ttlSeconds）被拒绝，避免调用方误以为设置成功', async () => {
+  const png = await makeTestImage(100, 100, '#111111', '#222222');
+
+  // direct 路由：query 传 ttlHours
+  const hash = createHash('sha256').update(png).digest('hex');
+  let resp = await fetch(base + '/api/upload/direct?ttlHours=72', {
+    method: 'POST',
+    headers: auth({ 'Content-Type': 'application/octet-stream', 'x-filename': 'p5a.png', 'x-hash': hash }),
+    body: png,
+  });
+  assert.equal(resp.status, 400);
+  assert.match((await resp.json()).error, /ttlHours|不支持的 TTL 字段/);
+
+  // multipart 路由：body 传 ttlSeconds
+  const fd = new FormData();
+  fd.append('file', new Blob([png]), 'p5b.png');
+  fd.append('ttlSeconds', '180');
+  resp = await fetch(base + '/api/upload', { method: 'POST', headers: auth(), body: fd });
+  assert.equal(resp.status, 400);
+  assert.match((await resp.json()).error, /ttlSeconds|不支持的 TTL 字段/);
+});

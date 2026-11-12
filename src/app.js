@@ -105,6 +105,19 @@ export function createApp({
     return { ok: false };
   }
 
+  /** TTL 别名字段：调用方误用这些字段名时返回 400，避免静默忽略导致误以为设置成功 */
+  const TTL_ALIAS_KEYS = ['ttlHours', 'ttlSeconds', 'ttl_hours', 'ttl_seconds', 'ttlhours', 'ttlseconds'];
+  /** 检测来源对象中是否存在 TTL 别名字段，返回命中的字段名或 null */
+  function checkTtlAlias(source) {
+    if (!source) return null;
+    for (const k of Object.keys(source)) {
+      if (TTL_ALIAS_KEYS.includes(k) && source[k] != null && String(source[k]).trim() !== '') {
+        return k;
+      }
+    }
+    return null;
+  }
+
   app.use(express.json({ limit: '1mb' }));
 
   const md = createRenderer();
@@ -302,6 +315,8 @@ export function createApp({
         return res.status(400).json({ error: '缺少文件名或指纹' });
       }
       if (req.body.length === 0) return res.status(400).json({ error: '空文件' });
+      const aliasHit = checkTtlAlias(req.query);
+      if (aliasHit) return res.status(400).json({ error: `不支持的 TTL 字段 "${aliasHit}"，请使用 ttl` });
       const ttl = parseTtl(req.headers['x-ttl'] ?? req.query.ttl);
       if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 / 72 / 3min' });
       // 服务端重算指纹，校验与客户端声明一致（防伪造 hash 污染内容寻址）
@@ -318,6 +333,7 @@ export function createApp({
     })().catch((err) => handleUploadError(err, res));
   });
 
+  
   /* ---------- 资产 ---------- */
   // multipart/form-data 直传：字段名 file，Bearer token 鉴权，返回 JSON 直链
   const multipartUpload = multer({
@@ -336,6 +352,8 @@ export function createApp({
     (async () => {
       const file = req.file;
       if (!file || !file.buffer.length) return res.status(400).json({ error: '未提供文件（字段名 file）' });
+      const aliasHit = checkTtlAlias({ ...req.query, ...req.body });
+      if (aliasHit) return res.status(400).json({ error: `不支持的 TTL 字段 "${aliasHit}"，请使用 ttl` });
       const ttl = parseTtl(req.query.ttl ?? req.body?.ttl);
       if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 / 72 / 3min' });
       const hash = createHash('sha256').update(file.buffer).digest('hex');
