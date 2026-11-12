@@ -51,13 +51,13 @@ export function createApp({
     chunkSize: chunkSize ?? Number(process.env.UPLOAD_CHUNK_SIZE || 4 * 1024 * 1024),
   });
 
-  /** 入库回调：嗅探 → sharp 流水线 → 存储 → 资产行（hash 唯一去重）；ttlHours 控制到期自动删除 */
-  async function createAssetFromBuffer(buffer, filename, declaredHash, ttlHours = 24) {
+  /** 入库回调：嗅探 → sharp 流水线 → 存储 → 资产行（hash 唯一去重）；ttlSeconds 控制到期自动删除 */
+  async function createAssetFromBuffer(buffer, filename, declaredHash, ttlSeconds = 86400) {
     const info = sniff(buffer);
     if (!info) {
       throw new UploadError('不支持的文件类型（白名单：jpg / png / webp / gif / avif）', 415);
     }
-    const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
 
     const existing = db.findAssetByHash(declaredHash);
     if (existing && storage.exists(existing.storage_key)) {
@@ -87,12 +87,16 @@ export function createApp({
     }
   }
 
-  /** 解析 ttl 参数：仅允许 24 / 72，默认 24 */
+  /** 解析 ttl 参数：支持 24 / 72（小时）与 3min（3 分钟，测试/临时图），默认 24h */
   function parseTtl(raw) {
-    const n = Number(raw);
-    if (!Number.isFinite(n)) return { ok: true, value: 24 };
-    if (![24, 72].includes(n)) return { ok: false };
-    return { ok: true, value: n };
+    if (raw == null || raw === '') return { ok: true, seconds: 86400 };
+    const s = String(raw).trim().toLowerCase();
+    if (s === '3min' || s === '3m') return { ok: true, seconds: 180 };
+    const n = Number(s.replace(/h$/, ''));
+    if (!Number.isFinite(n)) return { ok: false };
+    if (n === 24) return { ok: true, seconds: 86400 };
+    if (n === 72) return { ok: true, seconds: 259200 };
+    return { ok: false };
   }
 
   app.use(express.json({ limit: '1mb' }));
@@ -293,13 +297,13 @@ export function createApp({
       }
       if (req.body.length === 0) return res.status(400).json({ error: '空文件' });
       const ttl = parseTtl(req.headers['x-ttl'] ?? req.query.ttl);
-      if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 或 72（小时）' });
+      if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 / 72 / 3min' });
       const existing = db.findAssetByHash(String(hash).toLowerCase());
       if (existing && storage.exists(existing.storage_key)) {
-        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.value * 3600 * 1000).toISOString());
+        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.seconds * 1000).toISOString());
         return res.json({ assetId: existing.id, deduped: true });
       }
-      const r = await createAssetFromBuffer(req.body, decodeURIComponent(String(filename)), String(hash).toLowerCase(), ttl.value);
+      const r = await createAssetFromBuffer(req.body, decodeURIComponent(String(filename)), String(hash).toLowerCase(), ttl.seconds);
       res.json(r);
     })().catch((err) => handleUploadError(err, res));
   });
@@ -323,15 +327,15 @@ export function createApp({
       const file = req.file;
       if (!file || !file.buffer.length) return res.status(400).json({ error: '未提供文件（字段名 file）' });
       const ttl = parseTtl(req.query.ttl ?? req.body?.ttl);
-      if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 或 72（小时）' });
+      if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 / 72 / 3min' });
       const hash = createHash('sha256').update(file.buffer).digest('hex');
       const existing = db.findAssetByHash(hash);
       if (existing && storage.exists(existing.storage_key)) {
-        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.value * 3600 * 1000).toISOString());
+        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.seconds * 1000).toISOString());
         return res.json(buildUploadResponse(req, db.getAsset(existing.id), true));
       }
       const filename = file.originalname || 'upload.bin';
-      const { assetId } = await createAssetFromBuffer(file.buffer, filename, hash, ttl.value);
+      const { assetId } = await createAssetFromBuffer(file.buffer, filename, hash, ttl.seconds);
       const asset = db.getAsset(assetId);
       res.json(buildUploadResponse(req, asset, false));
     })().catch((err) => handleUploadError(err, res));
@@ -341,8 +345,8 @@ export function createApp({
     const proto = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const origin = `${proto}://${host}`;
-    const ttlHours = asset.expires_at && asset.created_at
-      ? Math.round((new Date(asset.expires_at) - new Date(asset.created_at)) / 3600000)
+    const ttlSeconds = asset.expires_at && asset.created_at
+      ? Math.round((new Date(asset.expires_at) - new Date(asset.created_at)) / 1000)
       : null;
     return {
       assetId: asset.id,
@@ -351,7 +355,8 @@ export function createApp({
       thumb: `${origin}/media/${asset.thumb_key}`,
       preview: `${origin}/media/${asset.preview_key}`,
       mime: asset.mime, size: asset.size, width: asset.width, height: asset.height,
-      ttlHours,
+      ttlSeconds,
+      ttlHours: ttlSeconds != null ? Math.round((ttlSeconds / 3600) * 100) / 100 : null,
       expiresAt: asset.expires_at,
     };
   }

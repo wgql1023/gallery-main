@@ -632,6 +632,16 @@ test('ttl：?ttl=72 设置 72h；非法值 400', async () => {
   assert.match((await resp.json()).error, /ttl/);
 });
 
+test('ttl：3min 测试选项，约 180 秒后到期', async () => {
+  const png = await makeTestImage(150, 150, '#abcdef', '#fedcba');
+  const fd = new FormData();
+  fd.append('file', new Blob([png]), '3min.png');
+  const r = await (await fetch(base + '/api/upload?ttl=3min', { method: 'POST', headers: auth(), body: fd })).json();
+  assert.equal(r.ttlSeconds, 180);
+  const diffS = (new Date(r.expiresAt) - Date.now()) / 1000;
+  assert.ok(diffS > 175 && diffS < 185, `到期应约 180s，实际 ${diffS}`);
+});
+
 test('到期清理：过期资产文件与记录被自动删除', async () => {
   const png = await makeTestImage(220, 220, '#778899', '#998877');
   const fd = new FormData();
