@@ -332,22 +332,19 @@ export function createApp({
       const existing = db.findAssetByHash(hash);
       if (existing && storage.exists(existing.storage_key)) {
         db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.seconds * 1000).toISOString());
-        return res.json(buildUploadResponse(req, db.getAsset(existing.id), true));
+        return res.json(buildUploadResponse(req, db.getAsset(existing.id), true, ttl.seconds));
       }
       const filename = file.originalname || 'upload.bin';
       const { assetId } = await createAssetFromBuffer(file.buffer, filename, hash, ttl.seconds);
       const asset = db.getAsset(assetId);
-      res.json(buildUploadResponse(req, asset, false));
+      res.json(buildUploadResponse(req, asset, false, ttl.seconds));
     })().catch((err) => handleUploadError(err, res));
   });
 
-  function buildUploadResponse(req, asset, deduped) {
+  function buildUploadResponse(req, asset, deduped, ttlSeconds) {
     const proto = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const origin = `${proto}://${host}`;
-    const ttlSeconds = asset.expires_at && asset.created_at
-      ? Math.round((new Date(asset.expires_at) - new Date(asset.created_at)) / 1000)
-      : null;
     return {
       assetId: asset.id,
       deduped,
