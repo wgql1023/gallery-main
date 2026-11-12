@@ -29,6 +29,11 @@ export function createApp({
   const storage = new LocalStorage(uploadsDir);
   const app = express();
   app.disable('x-powered-by');
+
+  // 健康检查：最早注册，平台探活 / 反代健康探测用，不依赖任何中间件
+  app.get('/health', (req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
+  app.get('/healthz', (req, res) => res.status(200).end());
+
   // 简易 Cookie 解析（免依赖，后台页面会话用）
   app.use((req, res, next) => {
     req.cookies = {};

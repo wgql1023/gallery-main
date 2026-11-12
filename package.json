@@ -7,9 +7,10 @@
   "engines": {
     "node": ">=22.5.0"
   },
+  "main": "entry.js",
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server.js",
-    "dev": "node --disable-warning=ExperimentalWarning --watch server.js",
+    "start": "node --disable-warning=ExperimentalWarning entry.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch entry.js",
     "test": "node --disable-warning=ExperimentalWarning --test",
     "seed": "node --disable-warning=ExperimentalWarning src/seed.js"
   },
