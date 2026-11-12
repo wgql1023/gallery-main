@@ -149,6 +149,14 @@ export function openDb(dbPath, { adminUser, adminPassword } = {}) {
         'SELECT * FROM assets WHERE id NOT IN (SELECT DISTINCT asset_id FROM share_assets)'
       ).all();
     },
+    /** 指定 ID 集合中、删除分享后变成孤儿的资产（供删除分享联动清理） */
+    listOrphanAssetsByIds(ids) {
+      if (!ids.length) return [];
+      const ph = ids.map(() => '?').join(',');
+      return sqlite.prepare(
+        `SELECT * FROM assets WHERE id IN (${ph}) AND id NOT IN (SELECT DISTINCT asset_id FROM share_assets)`
+      ).all(...ids);
+    },
 
     /* ---- 分享 ---- */
     insertShare({ title, content_text, status }) {

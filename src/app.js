@@ -3,7 +3,7 @@ import express from 'express';
 import multer from 'multer';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { openDb } from './db.js';
 import { hashPassword, verifyPassword, signJWT, verifyJWT, requireAdmin } from './lib/auth.js';
 import { LocalStorage } from './lib/storage.js';
@@ -53,6 +53,7 @@ export function createApp({
 
   /** 入库回调：嗅探 → sharp 流水线 → 存储 → 资产行（hash 唯一去重）；ttlSeconds 控制到期自动删除 */
   async function createAssetFromBuffer(buffer, filename, declaredHash, ttlSeconds = 86400) {
+    const safeName = basename(String(filename || 'upload.bin'));
     const info = sniff(buffer);
     if (!info) {
       throw new UploadError('不支持的文件类型（白名单：jpg / png / webp / gif / avif）', 415);
@@ -61,10 +62,15 @@ export function createApp({
 
     const existing = db.findAssetByHash(declaredHash);
     if (existing && storage.exists(existing.storage_key)) {
-      db.updateAssetExpiry(existing.id, expiresAt);  // 秒传续期
-      return { assetId: existing.id, deduped: true };
+      // 秒传命中：不改写已有资产到期时间，返回数据库真实值
+      return { assetId: existing.id, deduped: true, expiresAt: existing.expires_at };
     }
-    const processed = await processImage(buffer);
+    let processed;
+    try {
+      processed = await processImage(buffer);
+    } catch (err) {
+      throw new UploadError('图片解码失败，文件可能已损坏', 400);
+    }
     const assetKey = storage.assetKey(declaredHash, info.ext);
     const thumbKey = assetKey.replace(/(\.[^.]+)$/, '.thumb.webp');
     const previewKey = assetKey.replace(/(\.[^.]+)$/, '.preview.webp');
@@ -77,7 +83,7 @@ export function createApp({
       mime: info.mime, size: buffer.length, width: processed.width, height: processed.height,
       blurhash: processed.blurhash, expires_at: expiresAt,
     });
-    return { assetId, deduped: false };
+    return { assetId, deduped: false, expiresAt };
   }
 
   /** 删除资产对应的全部文件（原图 + 缩略图 + 预览图） */
@@ -298,12 +304,16 @@ export function createApp({
       if (req.body.length === 0) return res.status(400).json({ error: '空文件' });
       const ttl = parseTtl(req.headers['x-ttl'] ?? req.query.ttl);
       if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 / 72 / 3min' });
-      const existing = db.findAssetByHash(String(hash).toLowerCase());
-      if (existing && storage.exists(existing.storage_key)) {
-        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.seconds * 1000).toISOString());
-        return res.json({ assetId: existing.id, deduped: true });
+      // 服务端重算指纹，校验与客户端声明一致（防伪造 hash 污染内容寻址）
+      const actualHash = createHash('sha256').update(req.body).digest('hex');
+      if (actualHash !== String(hash).toLowerCase()) {
+        return res.status(400).json({ error: '文件指纹与内容不一致' });
       }
-      const r = await createAssetFromBuffer(req.body, decodeURIComponent(String(filename)), String(hash).toLowerCase(), ttl.seconds);
+      const existing = db.findAssetByHash(actualHash);
+      if (existing && storage.exists(existing.storage_key)) {
+        return res.json({ assetId: existing.id, deduped: true, expiresAt: existing.expires_at });
+      }
+      const r = await createAssetFromBuffer(req.body, decodeURIComponent(String(filename)), actualHash, ttl.seconds);
       res.json(r);
     })().catch((err) => handleUploadError(err, res));
   });
@@ -331,7 +341,7 @@ export function createApp({
       const hash = createHash('sha256').update(file.buffer).digest('hex');
       const existing = db.findAssetByHash(hash);
       if (existing && storage.exists(existing.storage_key)) {
-        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.seconds * 1000).toISOString());
+
         return res.json(buildUploadResponse(req, db.getAsset(existing.id), true, ttl.seconds));
       }
       const filename = file.originalname || 'upload.bin';
@@ -426,10 +436,11 @@ export function createApp({
     const id = Number(req.params.id);
     const share = db.getShare(id);
     if (!share) return res.status(404).json({ error: '不存在' });
+    // 先取出该分享引用的资产 ID，删除后仅清理其中变成孤儿的，避免误删全站其他孤儿资产
+    const shareAssets = db.listShareAssets(id);
     db.deleteShare(id);
-    // 联动清理：未被任何分享引用的孤儿资产删除文件与记录
     let removed = 0;
-    for (const orphan of db.listOrphanAssets()) {
+    for (const orphan of db.listOrphanAssetsByIds(shareAssets.map((a) => a.id))) {
       removeAssetFiles(orphan);
       db.deleteAsset(orphan.id);
       removed++;

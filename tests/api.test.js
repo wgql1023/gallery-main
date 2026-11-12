@@ -657,3 +657,73 @@ test('到期清理：过期资产文件与记录被自动删除', async () => {
   assert.equal((await fetch(base + '/api/assets/' + r.assetId, { headers: auth() })).status, 404);
   assert.equal((await fetch(base + '/media/' + mediaKey)).status, 404);
 });
+/* ---------- 测试报告问题回归：P1/P3/P4 修复验证 ---------- */
+
+test('P1：秒传命中不改写已有资产 expires_at', async () => {
+  const png = await makeTestImage(250, 250, '#00ff00', '#00aa00');
+  const hash = createHash('sha256').update(png).digest('hex');
+  // 首次上传，设置 ttl=3min（180s）
+  let resp = await fetch(base + '/api/upload/direct?ttl=3min', {
+    method: 'POST',
+    headers: auth({ 'Content-Type': 'application/octet-stream', 'x-filename': 'p1a.png', 'x-hash': hash }),
+    body: png,
+  });
+  const r1 = await resp.json();
+  assert.equal(r1.deduped, false);
+  assert.ok(r1.expiresAt);
+  const firstExpiry = r1.expiresAt;
+
+  // 再次秒传，这次用 ttl=72h —— 不应改写已有资产到期时间
+  resp = await fetch(base + '/api/upload/direct?ttl=72', {
+    method: 'POST',
+    headers: auth({ 'Content-Type': 'application/octet-stream', 'x-filename': 'p1b.png', 'x-hash': hash }),
+    body: png,
+  });
+  const r2 = await resp.json();
+  assert.equal(r2.deduped, true);
+  assert.equal(r2.assetId, r1.assetId);
+  assert.equal(r2.expiresAt, firstExpiry, '秒传不应改写已有资产到期时间');
+
+  // multipart 秒传同样不改写
+  const fd = new FormData();
+  fd.append('file', new Blob([png]), 'p1c.png');
+  const rm = await (await fetch(base + '/api/upload?ttl=72', { method: 'POST', headers: auth(), body: fd })).json();
+  assert.equal(rm.deduped, true);
+  assert.equal(rm.assetId, r1.assetId);
+  assert.equal(rm.expiresAt, firstExpiry, 'multipart 秒传同样不应改写到期时间');
+});
+
+test('P3：direct 直传 x-hash 与内容不一致返回 400', async () => {
+  const png = await makeTestImage(120, 120, '#ff00ff', '#aa00aa');
+  // 伪造一个与内容不匹配的 hash
+  const fakeHash = '0'.repeat(64);
+  const resp = await fetch(base + '/api/upload/direct', {
+    method: 'POST',
+    headers: auth({ 'Content-Type': 'application/octet-stream', 'x-filename': 'p3.png', 'x-hash': fakeHash }),
+    body: png,
+  });
+  assert.equal(resp.status, 400);
+  assert.match((await resp.json()).error, /指纹.*不一致|不一致/);
+});
+
+test('P4：magic 通过但 sharp 解码失败返回 400 而非 500', async () => {
+  // 构造合法 PNG 头 + 损坏数据，sniff 识别为 png 但 sharp 解码抛错
+  const corrupted = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), // PNG magic
+    Buffer.from('corrupted-data-not-a-valid-png-chunk'),
+  ]);
+  const hash = createHash('sha256').update(corrupted).digest('hex');
+  let resp = await fetch(base + '/api/upload/direct', {
+    method: 'POST',
+    headers: auth({ 'Content-Type': 'application/octet-stream', 'x-filename': 'p4.png', 'x-hash': hash }),
+    body: corrupted,
+  });
+  assert.equal(resp.status, 400, '解码失败应返回 400，而非 500');
+  assert.match((await resp.json()).error, /解码失败|损坏/);
+
+  // multipart 路由同样
+  const fd = new FormData();
+  fd.append('file', new Blob([corrupted]), 'p4b.png');
+  resp = await fetch(base + '/api/upload', { method: 'POST', headers: auth(), body: fd });
+  assert.equal(resp.status, 400, 'multipart 解码失败同样应返回 400');
+});

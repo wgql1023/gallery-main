@@ -2,6 +2,7 @@
 // ① init 预检（hash 命中即秒传）→ ② chunk 分块写入 → ③ complete 按序合并 + 重算 hash 校验 → ④ 入库 + 缩略图
 // 会话 24h 过期；孤儿分块定时清理。
 import { createHash, randomBytes } from 'node:crypto';
+import { basename } from 'node:path';
 
 export class UploadError extends Error {
   constructor(message, status = 400) {
@@ -34,6 +35,7 @@ export class UploadManager {
    */
   init({ filename, size, hash }) {
     if (typeof filename !== 'string' || !filename.trim()) throw new UploadError('缺少文件名');
+    const safeName = basename(filename.trim());
     const fileSize = Number(size);
     if (!Number.isFinite(fileSize) || fileSize <= 0) throw new UploadError('文件大小非法');
     if (!/^[0-9a-f]{64}$/i.test(String(hash))) throw new UploadError('文件指纹（SHA-256）格式非法');
@@ -58,7 +60,7 @@ export class UploadManager {
     const id = this.newSessionId();
     const totalChunks = Math.max(1, Math.ceil(fileSize / this.chunkSize));
     this.db.insertUploadSession({
-      id, filename: filename.trim(), size: fileSize, hash: String(hash).toLowerCase(),
+      id, filename: safeName, size: fileSize, hash: String(hash).toLowerCase(),
       chunkSize: this.chunkSize, totalChunks, received: '[]',
     });
     return { exists: false, uploadId: id, chunkSize: this.chunkSize, totalChunks, uploadedChunks: [] };
