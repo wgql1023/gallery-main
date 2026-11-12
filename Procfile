@@ -1,1 +1,1 @@
-web: npm start
+web: node --disable-warning=ExperimentalWarning index.js

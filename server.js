@@ -1,7 +1,7 @@
 // 图片分享系统 —— 入口
 import { createApp } from './src/app.js';
 
-const PORT = Number(process.env.PORT || 3100);
+const PORT = Number(process.env.APP_PORT || process.env.PORT || 8000);
 const HOST = process.env.HOST || '0.0.0.0';
 const app = createApp();
 
