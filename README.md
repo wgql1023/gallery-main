@@ -85,7 +85,7 @@ npm start          # 默认监听 0.0.0.0:8000（可用 PORT=3100 覆盖）
 
 ```bash
 npm run seed       # 生成 8 张演示图 + 2 个已发布分享 + 1 个草稿（仅空库时生效）
-npm test           # 34 个单元 / 接口测试
+npm test           # 37 个单元 / 接口测试
 ```
 
 自定义：`PORT=8080 npm start`、`ADMIN_USER=xxx ADMIN_PASSWORD=xxx npm start`
@@ -127,7 +127,7 @@ gallery-main/
 │   ├── uploader.mjs        # ⭐ 上传客户端（并发 / 重试 / 暂停 / 续传）
 │   ├── sha256.mjs          # 纯 JS 增量 SHA-256
 │   └── hash-worker.mjs     # Web Worker 指纹计算
-├── tests/                  # 34 个单元 / 接口测试
+├── tests/                  # 37 个单元 / 接口测试
 ├── docs/screenshots/       # README 截图
 └── data/                   # 运行数据（首次运行自动创建，已在 .gitignore 排除）
     ├── gallery.db          # SQLite 数据库：分享 / 资产索引 / 上传会话 / 站点配置等
@@ -141,7 +141,7 @@ gallery-main/
 ```
 GET    /health                       健康检查（探活，无需鉴权）
 POST   /api/admin/login               登录 → JWT（同时写入 Cookie 会话）
-POST   /api/upload                    ⭐ multipart 直传图片 → JSON 外链（Bearer token 鉴权）
+POST   /api/upload                    ⭐ multipart 直传图片 → JSON 外链（Bearer token 鉴权，ttl 24h/72h 到期自动删除）
 POST   /api/upload/init               预检：秒传 / 续传 / 建会话
 PUT    /api/upload/chunk/:id/:index   传分块（4MB）
 POST   /api/upload/complete/:id       合并 + 校验 + 入库
@@ -199,7 +199,14 @@ Content-Type: image/jpeg
 --boundary--
 ```
 
-**字段**：`file`（必填，单文件，上限 8MB）
+**字段**：
+
+| 字段 | 位置 | 必填 | 说明 |
+|---|---|---|---|
+| `file` | multipart | 是 | 单文件，上限 8MB |
+| `ttl` | query 或 multipart | 否 | 到期自动删除时长（小时），仅支持 `24` / `72`，默认 `24` |
+
+> `ttl` 两种传法等价：`?ttl=72` 或 multipart 文本字段 `ttl=72`。到期后服务端自动删除原图 / 缩略图 / 预览图与数据库记录。
 
 **成功响应** `200`：
 ```json
@@ -212,7 +219,9 @@ Content-Type: image/jpeg
   "mime":    "image/png",
   "size":    8592,
   "width":   800,
-  "height":  600
+  "height":  600,
+  "ttlHours": 24,
+  "expiresAt": "2026-11-13T16:00:00.000Z"
 }
 ```
 
@@ -221,13 +230,20 @@ Content-Type: image/jpeg
 | `url` | **原图外链直链**，可公开访问（无需 token），`Cache-Control: immutable` |
 | `thumb` | 缩略图外链（WebP，宽 480px） |
 | `preview` | 预览图外链（WebP，宽 1080px） |
-| `deduped` | `true` 表示内容已存在，秒传命中，未实际写盘 |
+| `deduped` | `true` 表示内容已存在，秒传命中，未实际写盘（会按本次 ttl 续期） |
+| `ttlHours` | 到期时长（24 或 72） |
+| `expiresAt` | 到期时间（ISO 8601），届时自动删除 |
 | `assetId` | 资产 ID，用于后续发布分享时引用 |
 
 **curl 示例**：
 ```bash
-# 上传并直接拿到外链
+# 默认 24h 后自动删除
 curl -X POST https://your-host/api/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@photo.jpg"
+
+# 指定 72h 后删除
+curl -X POST "https://your-host/api/upload?ttl=72" \
   -H "Authorization: Bearer $TOKEN" \
   -F "file=@photo.jpg"
 ```
@@ -258,7 +274,7 @@ print(r.json()['url'])  # 图片外链
 | 状态码 | 含义 |
 |---|---|
 | `401` | 未提供 token 或 token 无效 |
-| `400` | 未提供 `file` 字段 / multipart 解析失败 |
+| `400` | 未提供 `file` 字段 / multipart 解析失败 / `ttl` 非 24 或 72 |
 | `413` | 文件超过 8MB 上限 |
 | `415` | magic number 不在白名单（伪装文件被拒） |
 | `500` | 服务端处理失败（sharp 异常 / 磁盘满等） |
@@ -326,7 +342,7 @@ curl -s -X POST $HOST/api/shares \
 npm test
 ```
 
-34 个测试覆盖：断点续传全流程（部分上传 → 重新 init 返回已传列表 → 补齐完成）、**分块损坏指纹校验拒绝**、秒传去重、magic number 伪装文件拒绝（415）、**multipart 直传 `/api/upload`（鉴权 / 秒传 / 直链可访问 / 伪装拒绝）**、目录穿越防护、草稿前台不可见、删除联动清理、Cookie 会话守卫 302、密码修改后旧密码失效、blurhash 往返、纯 JS SHA-256 与 node:crypto 随机对照等。
+37 个测试覆盖：断点续传全流程（部分上传 → 重新 init 返回已传列表 → 补齐完成）、**分块损坏指纹校验拒绝**、秒传去重、magic number 伪装文件拒绝（415）、**multipart 直传 `/api/upload`（鉴权 / 秒传 / 直链可访问 / 伪装拒绝）**、**ttl 24h/72h 参数与到期自动删除**、目录穿越防护、草稿前台不可见、删除联动清理、Cookie 会话守卫 302、密码修改后旧密码失效、blurhash 往返、纯 JS SHA-256 与 node:crypto 随机对照等。
 
 ## 📄 License
 

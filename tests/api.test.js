@@ -591,3 +591,59 @@ test('multipart 上传：未带 token 401；缺字段 400；伪装文件 415', a
   resp = await fetch(base + '/api/upload', { method: 'POST', headers: auth(), body: fd2 });
   assert.equal(resp.status, 415);
 });
+/* ---------- 图片到期自动删除（ttl 24h/72h） ---------- */
+
+test('ttl：默认 24h，响应含 ttlHours 与 expiresAt', async () => {
+  const png = await makeTestImage(200, 200, '#aabbcc', '#ccbbaa');
+  const fd = new FormData();
+  fd.append('file', new Blob([png]), 'ttl24.png');
+  const resp = await fetch(base + '/api/upload', { method: 'POST', headers: auth(), body: fd });
+  const r = await resp.json();
+  assert.equal(r.ttlHours, 24);
+  assert.ok(r.expiresAt);
+  const diffH = (new Date(r.expiresAt) - Date.now()) / 3600000;
+  assert.ok(diffH > 23.9 && diffH < 24.1, `到期应约 24h，实际 ${diffH}`);
+});
+
+test('ttl：?ttl=72 设置 72h；非法值 400', async () => {
+  const png = await makeTestImage(180, 180, '#112233', '#332211');
+  const fd = new FormData();
+  fd.append('file', new Blob([png]), 'ttl72.png');
+  let resp = await fetch(base + '/api/upload?ttl=72', { method: 'POST', headers: auth(), body: fd });
+  let r = await resp.json();
+  assert.equal(r.ttlHours, 72);
+  const diffH = (new Date(r.expiresAt) - Date.now()) / 3600000;
+  assert.ok(diffH > 71.9 && diffH < 72.1);
+
+  // multipart 字段 ttl
+  const png2 = await makeTestImage(160, 160, '#444444', '#555555');
+  const fd2 = new FormData();
+  fd2.append('file', new Blob([png2]), 'ttl72b.png');
+  fd2.append('ttl', '72');
+  resp = await fetch(base + '/api/upload', { method: 'POST', headers: auth(), body: fd2 });
+  r = await resp.json();
+  assert.equal(r.ttlHours, 72);
+
+  // 非法 ttl
+  const fd3 = new FormData();
+  fd3.append('file', new Blob([png2]), 'bad.png');
+  resp = await fetch(base + '/api/upload?ttl=48', { method: 'POST', headers: auth(), body: fd3 });
+  assert.equal(resp.status, 400);
+  assert.match((await resp.json()).error, /ttl/);
+});
+
+test('到期清理：过期资产文件与记录被自动删除', async () => {
+  const png = await makeTestImage(220, 220, '#778899', '#998877');
+  const fd = new FormData();
+  fd.append('file', new Blob([png]), 'exp.png');
+  const r = await (await fetch(base + '/api/upload', { method: 'POST', headers: auth(), body: fd })).json();
+  const mediaKey = r.url.split('/media/')[1];
+  assert.equal((await fetch(base + '/media/' + mediaKey)).status, 200);
+
+  // 手动置为已过期并触发清理
+  app.locals.setAssetExpiry(r.assetId, new Date(Date.now() - 1000).toISOString());
+  app.locals.sweepExpiredAssets();
+
+  assert.equal((await fetch(base + '/api/assets/' + r.assetId, { headers: auth() })).status, 404);
+  assert.equal((await fetch(base + '/media/' + mediaKey)).status, 404);
+});

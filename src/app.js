@@ -51,30 +51,48 @@ export function createApp({
     chunkSize: chunkSize ?? Number(process.env.UPLOAD_CHUNK_SIZE || 4 * 1024 * 1024),
   });
 
-  /** 入库回调：嗅探 → sharp 流水线 → 存储 → 资产行（hash 唯一去重） */
-  async function createAssetFromBuffer(buffer, filename, declaredHash) {
+  /** 入库回调：嗅探 → sharp 流水线 → 存储 → 资产行（hash 唯一去重）；ttlHours 控制到期自动删除 */
+  async function createAssetFromBuffer(buffer, filename, declaredHash, ttlHours = 24) {
     const info = sniff(buffer);
     if (!info) {
       throw new UploadError('不支持的文件类型（白名单：jpg / png / webp / gif / avif）', 415);
+    }
+    const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000).toISOString();
+
+    const existing = db.findAssetByHash(declaredHash);
+    if (existing && storage.exists(existing.storage_key)) {
+      db.updateAssetExpiry(existing.id, expiresAt);  // 秒传续期
+      return { assetId: existing.id, deduped: true };
     }
     const processed = await processImage(buffer);
     const assetKey = storage.assetKey(declaredHash, info.ext);
     const thumbKey = assetKey.replace(/(\.[^.]+)$/, '.thumb.webp');
     const previewKey = assetKey.replace(/(\.[^.]+)$/, '.preview.webp');
 
-    const existing = db.findAssetByHash(declaredHash);
-    if (existing && storage.exists(existing.storage_key)) {
-      return { assetId: existing.id, deduped: true };
-    }
     storage.saveBuffer(assetKey, buffer);
     storage.saveBuffer(thumbKey, processed.thumb);
     storage.saveBuffer(previewKey, processed.preview);
     const assetId = db.insertAsset({
       hash: declaredHash, storage_key: assetKey, thumb_key: thumbKey, preview_key: previewKey,
       mime: info.mime, size: buffer.length, width: processed.width, height: processed.height,
-      blurhash: processed.blurhash,
+      blurhash: processed.blurhash, expires_at: expiresAt,
     });
     return { assetId, deduped: false };
+  }
+
+  /** 删除资产对应的全部文件（原图 + 缩略图 + 预览图） */
+  function removeAssetFiles(asset) {
+    for (const key of [asset.storage_key, asset.thumb_key, asset.preview_key]) {
+      if (key) storage.delete(key);
+    }
+  }
+
+  /** 解析 ttl 参数：仅允许 24 / 72，默认 24 */
+  function parseTtl(raw) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { ok: true, value: 24 };
+    if (![24, 72].includes(n)) return { ok: false };
+    return { ok: true, value: n };
   }
 
   app.use(express.json({ limit: '1mb' }));
@@ -274,11 +292,14 @@ export function createApp({
         return res.status(400).json({ error: '缺少文件名或指纹' });
       }
       if (req.body.length === 0) return res.status(400).json({ error: '空文件' });
+      const ttl = parseTtl(req.headers['x-ttl'] ?? req.query.ttl);
+      if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 或 72（小时）' });
       const existing = db.findAssetByHash(String(hash).toLowerCase());
       if (existing && storage.exists(existing.storage_key)) {
+        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.value * 3600 * 1000).toISOString());
         return res.json({ assetId: existing.id, deduped: true });
       }
-      const r = await createAssetFromBuffer(req.body, decodeURIComponent(String(filename)), String(hash).toLowerCase());
+      const r = await createAssetFromBuffer(req.body, decodeURIComponent(String(filename)), String(hash).toLowerCase(), ttl.value);
       res.json(r);
     })().catch((err) => handleUploadError(err, res));
   });
@@ -301,13 +322,16 @@ export function createApp({
     (async () => {
       const file = req.file;
       if (!file || !file.buffer.length) return res.status(400).json({ error: '未提供文件（字段名 file）' });
+      const ttl = parseTtl(req.query.ttl ?? req.body?.ttl);
+      if (!ttl.ok) return res.status(400).json({ error: 'ttl 仅支持 24 或 72（小时）' });
       const hash = createHash('sha256').update(file.buffer).digest('hex');
       const existing = db.findAssetByHash(hash);
       if (existing && storage.exists(existing.storage_key)) {
-        return res.json(buildUploadResponse(req, existing, true));
+        db.updateAssetExpiry(existing.id, new Date(Date.now() + ttl.value * 3600 * 1000).toISOString());
+        return res.json(buildUploadResponse(req, db.getAsset(existing.id), true));
       }
       const filename = file.originalname || 'upload.bin';
-      const { assetId } = await createAssetFromBuffer(file.buffer, filename, hash);
+      const { assetId } = await createAssetFromBuffer(file.buffer, filename, hash, ttl.value);
       const asset = db.getAsset(assetId);
       res.json(buildUploadResponse(req, asset, false));
     })().catch((err) => handleUploadError(err, res));
@@ -317,6 +341,9 @@ export function createApp({
     const proto = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const origin = `${proto}://${host}`;
+    const ttlHours = asset.expires_at && asset.created_at
+      ? Math.round((new Date(asset.expires_at) - new Date(asset.created_at)) / 3600000)
+      : null;
     return {
       assetId: asset.id,
       deduped,
@@ -324,6 +351,8 @@ export function createApp({
       thumb: `${origin}/media/${asset.thumb_key}`,
       preview: `${origin}/media/${asset.preview_key}`,
       mime: asset.mime, size: asset.size, width: asset.width, height: asset.height,
+      ttlHours,
+      expiresAt: asset.expires_at,
     };
   }
 
@@ -399,9 +428,7 @@ export function createApp({
     // 联动清理：未被任何分享引用的孤儿资产删除文件与记录
     let removed = 0;
     for (const orphan of db.listOrphanAssets()) {
-      for (const key of [orphan.storage_key, orphan.thumb_key, orphan.preview_key]) {
-        if (key) storage.delete(key);
-      }
+      removeAssetFiles(orphan);
       db.deleteAsset(orphan.id);
       removed++;
     }
@@ -449,8 +476,22 @@ export function createApp({
     res.status(500).send('服务器内部错误');
   });
 
+  /** 到期资产清理：扫描已过期资产，删除文件与记录 */
+  function sweepExpiredAssets() {
+    const nowIso = new Date().toISOString();
+    for (const a of db.listExpiredAssets(nowIso)) {
+      removeAssetFiles(a);
+      db.deleteAsset(a.id);
+      console.log(`[gallery] 资产 ${a.id} 已到期删除`);
+    }
+  }
+  app.locals.sweepExpiredAssets = sweepExpiredAssets;
+  app.locals.setAssetExpiry = (id, iso) => db.updateAssetExpiry(id, iso);
+
   app.locals.startTasks = () => {
     uploadManager.startCleanupTimer();
+    sweepExpiredAssets();
+    setInterval(sweepExpiredAssets, 10 * 60 * 1000).unref();
   };
 
   return app;

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS assets (
   width       INTEGER,
   height      INTEGER,
   blurhash    TEXT,
+  expires_at  TEXT,
   created_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS shares (
@@ -67,6 +68,8 @@ export function openDb(dbPath, { adminUser, adminPassword } = {}) {
   const sqlite = new DatabaseSync(dbPath);
   sqlite.exec('PRAGMA foreign_keys = ON');
   sqlite.exec(SCHEMA);
+  // 兼容旧库：补充 expires_at 列（已存在则忽略）
+  try { sqlite.exec('ALTER TABLE assets ADD COLUMN expires_at TEXT'); } catch {}
 
   const now = () => new Date().toISOString();
 
@@ -119,10 +122,13 @@ export function openDb(dbPath, { adminUser, adminPassword } = {}) {
     },
     insertAsset(a) {
       const r = sqlite.prepare(
-        `INSERT INTO assets (hash, storage_key, thumb_key, preview_key, mime, size, width, height, blurhash, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(a.hash, a.storage_key, a.thumb_key ?? null, a.preview_key ?? null, a.mime, a.size, a.width ?? null, a.height ?? null, a.blurhash ?? null, now());
+        `INSERT INTO assets (hash, storage_key, thumb_key, preview_key, mime, size, width, height, blurhash, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(a.hash, a.storage_key, a.thumb_key ?? null, a.preview_key ?? null, a.mime, a.size, a.width ?? null, a.height ?? null, a.blurhash ?? null, a.expires_at ?? null, now());
       return r.lastInsertRowid;
+    },
+    updateAssetExpiry(id, expiresAt) {
+      sqlite.prepare('UPDATE assets SET expires_at = ? WHERE id = ?').run(expiresAt, id);
     },
     listAssetsByIds(ids) {
       if (!ids.length) return [];
@@ -130,7 +136,12 @@ export function openDb(dbPath, { adminUser, adminPassword } = {}) {
       return sqlite.prepare(`SELECT * FROM assets WHERE id IN (${ph})`).all(...ids);
     },
     deleteAsset(id) {
+      sqlite.prepare('DELETE FROM share_assets WHERE asset_id = ?').run(id);
       sqlite.prepare('DELETE FROM assets WHERE id = ?').run(id);
+    },
+    /** 已到期资产（expires_at 非空且 <= nowIso） */
+    listExpiredAssets(nowIso) {
+      return sqlite.prepare('SELECT * FROM assets WHERE expires_at IS NOT NULL AND expires_at <= ?').all(nowIso);
     },
     /** 孤儿资产：未被任何 share 引用 */
     listOrphanAssets() {
